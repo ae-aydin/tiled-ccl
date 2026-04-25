@@ -27,3 +27,8 @@ make -j$(nproc)
 # The env var must be set before the process starts — OpenCV caches the pixel limit at library load time
 OPENCV_IO_MAX_IMAGE_PIXELS=10000000000 ./ccl [options]
 ```
+
+### License
+
+- BSD-3-Clause for src/basic_union_find.cu
+- MIT for rest
