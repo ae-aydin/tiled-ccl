@@ -1,0 +1,21 @@
+# Notes
+notes/
+*.txt
+!CMakeLists.txt
+*.md
+!README.md
+
+# Data
+debug_masks/
+gpx_masks/
+
+# C/C++
+build/
+compile_commands.json
+
+# Python
+.venv/
+
+# Misc
+.vscode
+.cache
