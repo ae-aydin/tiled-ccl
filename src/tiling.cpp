@@ -41,7 +41,7 @@ std::vector<TileInfo> extract_tiles(const cv::Mat& binary_mask, int tile_size, i
     int num_tile_cols = (image_width + tile_size - 1) / tile_size;
     int num_tile_rows = (image_height + tile_size - 1) / tile_size;
 
-    std::cout << "Tile grid: " << num_tile_cols << " x " << num_tile_rows << " = " << num_tile_cols * num_tile_rows << " tiles\n\n";
+    std::cout << "Tile grid: " << num_tile_cols << " x " << num_tile_rows << " = " << num_tile_cols * num_tile_rows << " tiles\n";
 
     std::vector<TileInfo> all_tiles;
     all_tiles.reserve(num_tile_cols * num_tile_rows);
@@ -144,43 +144,71 @@ int merge_seams(std::vector<TileInfo>& tiles, UnionFind& union_find, int num_til
     return total_merges;
 }
 
-// REVISIT
+
 cv::Mat build_label_map(const std::vector<TileInfo>& tiles, UnionFind& union_find, int image_height, int image_width, int max_global_label, int& out_num_final_components) {
-    // Serial pass: map every global label to its final compact ID.
-    // Pre-computing label_to_final_id avoids Find() calls in the parallel pixel loop —
-    // Find() does path-compression writes, which would race across threads.
+    // At this point every foreground pixel in the image has a globally unique label
+    // (an integer in [1, max_global_label]) assigned during Phase 1. Phase 2 ran
+    // union-find over the seams to record which of those global labels belong to the
+    // same connected component across tile boundaries.
+    //
+    // This function has two jobs:
+    //   1. Resolve the union-find to produce a compact final component ID for every
+    //      global label (IDs are 1..num_final_components, no gaps).
+    //   2. Write those final IDs into a full-image int32 label map.
+
+    // --- Step 1: Build a lookup table from global label → final component ID ---
+    //
+    // We do this in a serial loop rather than calling Find() inside the parallel pixel
+    // loop below. Find() performs path compression (it writes to the union-find parent
+    // array to flatten the tree), so calling it from multiple threads simultaneously
+    // would cause data races. Doing it once here, serially, is safe and fast.
+    //
+    // root_to_final_id : maps a root label (canonical representative of a component)
+    //                    to its assigned final ID. Populated on first encounter.
+    // label_to_final_id: maps every global label directly to its final ID, so the
+    //                    parallel pixel loop below only needs a single array lookup.
     std::vector<int> root_to_final_id(max_global_label + 1, 0);
     std::vector<int> label_to_final_id(max_global_label + 1, 0);
     int num_final_components = 0;
     for (int g = 1; g <= max_global_label; g++) {
-        int root = union_find.Find(g);
-        if (root_to_final_id[root] == 0)
+        int root = union_find.Find(g); // which component does label g belong to?
+        if (root_to_final_id[root] == 0) // first time we see this root → assign it an ID
             root_to_final_id[root] = ++num_final_components;
-        label_to_final_id[g] = root_to_final_id[root];
+        label_to_final_id[g] = root_to_final_id[root]; // record final ID for fast lookup
     }
 
-    // Allocate uninitialized — the parallel loop below writes every pixel,
-    // so no background pixels are left with garbage values.
+    // --- Step 2: Write the full-image label map in parallel ---
+    //
+    // label_map is the output: same spatial dimensions as the input image, int32 per pixel.
+    // Allocated uninitialized here because every pixel is written by the loop below —
+    // no pixel is left unwritten, so no garbage values escape.
     cv::Mat label_map(image_height, image_width, CV_32S);
 
-    // Each tile owns a non-overlapping region of label_map → no write races.
-    // label_to_final_id is read-only here → no read races.
-    // Skipping cv::Mat::zeros (single-threaded 6-7 GB memset) and instead
-    // writing every pixel in the parallel loop, which also pre-faults all pages.
+    // Each tile owns a distinct, non-overlapping rectangle of label_map, so parallel
+    // writes across tiles cannot race. label_to_final_id is read-only in this loop.
+    // schedule(dynamic) because tiles vary in size and empty vs non-empty tiles differ
+    // greatly in work — dynamic scheduling balances load across threads.
     #pragma omp parallel for schedule(dynamic)
     for (int t = 0; t < (int)tiles.size(); t++) {
         const TileInfo& tile = tiles[t];
+
         if (tile.local_label_mat.empty()) {
+            // Empty tile (all background): local_label_mat was never written,
+            // so there are no foreground labels to look up. Write zeros directly.
             for (int row = 0; row < tile.height; row++)
                 memset(label_map.ptr<int>(tile.origin_y + row) + tile.origin_x, 0, tile.width * sizeof(int));
             continue;
         }
+
         for (int row = 0; row < tile.height; row++) {
-            const int* src = tile.local_label_mat.ptr<int>(row);
+            const int* src = tile.local_label_mat.ptr<int>(row);  // local label per pixel (0 = background, 1..N = foreground)
             int* dst = label_map.ptr<int>(tile.origin_y + row) + tile.origin_x;
             for (int col = 0; col < tile.width; col++) {
                 int local = src[col];
-                if (local == 0) { dst[col] = 0; continue; }
+                if (local == 0) { dst[col] = 0; continue; }  // background pixel → 0
+                // local + global_label_offset converts the tile-local label into the
+                // globally unique label assigned during Phase 1. label_to_final_id then
+                // maps that to the final merged component ID from Phase 2.
                 dst[col] = label_to_final_id[local + tile.global_label_offset];
             }
         }
