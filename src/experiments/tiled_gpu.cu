@@ -101,6 +101,8 @@ cv::Mat run_tiled_gpu_ccl(const cv::Mat& binary_mask, int tile_size) {
         }
     }
 
+    double scan_ms = phase_timer.elapsed_ms();
+
     // label_storage: a single flat int32 buffer that holds the per-pixel label results
     // for all non-empty tiles packed end-to-end. Each tile's block starts at its
     // storage_offset. Phase 1 writes into it; Phase 3 reads from it via local_label_mat
@@ -121,6 +123,7 @@ cv::Mat run_tiled_gpu_ccl(const cv::Mat& binary_mask, int tile_size) {
     }
 
     double phase0_ms = phase_timer.elapsed_ms();
+    double prefault_ms = phase0_ms - scan_ms;
 
     // --- Phase 1: Double-buffered GPU CCL ---
     //
@@ -244,7 +247,8 @@ cv::Mat run_tiled_gpu_ccl(const cv::Mat& binary_mask, int tile_size) {
     std::cout << "Final components: " << num_final_components << "\n";
     std::cout << "Merged across seams: " << total_local_labels - num_final_components << "\n\n";
 
-    std::cout << "Time - Phase 0 (scan + alloc): " << phase0_ms << " ms\n";
+    std::cout << "Time - Phase 0 (scan + alloc): " << phase0_ms << " ms"
+              << "  [scan: " << scan_ms << " ms, pre-fault: " << prefault_ms << " ms]\n";
     std::cout << "Time - Phase 1 (GPU tile CCL): " << phase1_ms << " ms\n";
     std::cout << "Time - Phase 2 (seam merge): " << phase2_ms << " ms\n";
     std::cout << "Time - Phase 3 (relabel):  " << phase3_ms << " ms\n";
