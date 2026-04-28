@@ -8,10 +8,12 @@ notes/
 # Data
 debug_masks/
 gpx_masks/
+outputs/
 
 # C/C++
 build/
 compile_commands.json
+.clangd
 
 # Python
 .venv/
