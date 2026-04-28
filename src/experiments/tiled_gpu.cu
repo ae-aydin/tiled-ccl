@@ -7,6 +7,8 @@
 #include <vector>
 
 
+// Lightweight descriptor for a non-empty tile, used as the GPU work queue in Phase 1.
+// storage_offset is the index into the flat label_storage buffer where this tile's results go.
 struct TileID {
     int tile_row, tile_col;
     int origin_x, origin_y;
@@ -23,12 +25,17 @@ cv::Mat run_tiled_gpu_ccl(const cv::Mat& binary_mask, int tile_size) {
     int num_tile_rows = (image_height + tile_size - 1) / tile_size;
     int total_tiles = num_tile_cols * num_tile_rows;
 
-    // Allocate GPU resources before the timer — cudaMallocHost (pinned memory)
-    // is a one-time OS cost amortized over all images in a real pipeline.
+    // Allocate GPU buffers before the timer. AllocGPUTileBuffers calls cudaMallocHost which
+    // allocates pinned (page-locked) memory on the CPU side. Pinned memory allows the GPU to
+    // read/write it directly over PCIe without going through the OS virtual memory system,
+    // making host<->device transfers faster. It is expensive to allocate, so we do it once here.
     GPUTileBuffers gpu_bufs[2] = {
         AllocGPUTileBuffers(tile_size, tile_size),
         AllocGPUTileBuffers(tile_size, tile_size)
     };
+    // A CUDA stream is an ordered queue of GPU operations. Operations in the same stream
+    // run sequentially; operations in different streams can run concurrently.
+    // Two streams let us overlap GPU work on tile t+1 with CPU work on tile t.
     cudaStream_t streams[2];
     cudaStreamCreate(&streams[0]);
     cudaStreamCreate(&streams[1]);
@@ -43,20 +50,18 @@ cv::Mat run_tiled_gpu_ccl(const cv::Mat& binary_mask, int tile_size) {
     // --- Phase 0: Pre-scan ---
     //
     // The GPU double-buffer loop in Phase 1 needs to know all non-empty tiles upfront
-    // before launching any GPU work — it must know tile[t+1] before tile[t] finishes.
+    // before launching any GPU work, because it must know tile[t+1] before tile[t] finishes.
     // So we scan the full image first to separate empty tiles from non-empty ones.
     //
     // all_tiles: metadata for every tile (empty and non-empty), indexed by grid position.
-    //            Used by Phase 2 (seam merge) and Phase 3 (relabel), which need to
-    //            visit all tiles in order.
+    // Used by Phase 2 (seam merge) and Phase 3 (relabel), which need to visit all tiles.
     //
     // non_empty_list: ordered list of only the tiles that contain foreground pixels.
-    //                 This is the work queue the GPU pipeline consumes in Phase 1.
+    // This is the work queue the GPU pipeline consumes in Phase 1.
     //
     // total_storage_elems: cumulative pixel count across all non-empty tiles.
-    //                      Used to allocate label_storage to the exact size needed —
-    //                      no wasted space for empty tiles, which are the majority in
-    //                      sparse pathology images.
+    // Used to allocate label_storage exactly, with no wasted space for empty tiles
+    // (which are the majority in sparse pathology images).
     std::vector<TileInfo> all_tiles(total_tiles);
     std::vector<TileID> non_empty_list;
     non_empty_list.reserve(total_tiles);
@@ -74,7 +79,7 @@ cv::Mat run_tiled_gpu_ccl(const cv::Mat& binary_mask, int tile_size) {
             tile.origin_x = origin_x; tile.origin_y = origin_y;
             tile.width = tile_width; tile.height = tile_height;
 
-            // Scan this tile's pixels — exit as soon as any foreground pixel is found.
+            // Scan this tile's pixels, exit as soon as any foreground pixel is found.
             bool is_empty = true;
             for (int row = origin_y; row < origin_y + tile_height && is_empty; row++) {
                 const uint8_t* ptr = binary_mask.ptr(row) + origin_x;
@@ -84,7 +89,7 @@ cv::Mat run_tiled_gpu_ccl(const cv::Mat& binary_mask, int tile_size) {
 
             if (is_empty) {
                 // Empty tile: no foreground pixels, so no components and all edge labels
-                // are 0 (background). Fully resolved here — GPU never sees this tile.
+                // are 0 (background). Fully resolved here, GPU never sees this tile.
                 tile.num_local_labels = 1;
                 tile.global_label_offset = 0;
                 tile.left_edge_labels.assign(tile_height, 0);
@@ -103,16 +108,18 @@ cv::Mat run_tiled_gpu_ccl(const cv::Mat& binary_mask, int tile_size) {
 
     double scan_ms = phase_timer.elapsed_ms();
 
-    // label_storage: a single flat int32 buffer that holds the per-pixel label results
-    // for all non-empty tiles packed end-to-end. Each tile's block starts at its
-    // storage_offset. Phase 1 writes into it; Phase 3 reads from it via local_label_mat
-    // (a cv::Mat view into this buffer, so no copies needed at read time).
+    // label_storage: a single flat int32 buffer holding per-pixel label results for all
+    // non-empty tiles packed end-to-end. Each tile's block starts at its storage_offset.
+    // Phase 1 writes into it; Phase 3 reads via local_label_mat (a cv::Mat view, no copies).
     //
-    // Pre-faulting: modern OSes allocate memory lazily — new[] only reserves virtual address
-    // space; physical RAM pages are assigned on first write (a page fault). Without this
-    // loop, page faults would fire during Phase 1's copyTo calls, stalling the CPU side
-    // of the double-buffer pipeline mid-flight. Touching one element per 4 KB page now,
-    // in parallel with OpenMP, pays that cost upfront and in bulk.
+    // Pre-faulting: OSes allocate memory lazily. new[] only reserves virtual address space;
+    // physical RAM pages are mapped on first write, triggering a page fault per 4 KB page.
+    // Without this loop, those faults would fire during Phase 1's copyTo calls, stalling
+    // the CPU side of the pipeline mid-flight. Touching one element per page now, in parallel,
+    // pays the fault cost upfront in bulk before the timed pipeline starts.
+    //
+    // The "? 1" guard avoids allocating 0 bytes (undefined behavior in some allocators)
+    // when the image has no foreground pixels at all.
     std::unique_ptr<int32_t[]> label_storage(new int32_t[total_storage_elems ? total_storage_elems : 1]);
     {
         int32_t* p = label_storage.get();
@@ -127,94 +134,82 @@ cv::Mat run_tiled_gpu_ccl(const cv::Mat& binary_mask, int tile_size) {
 
     // --- Phase 1: Double-buffered GPU CCL ---
     //
-    // Processes non-empty tiles through the GPU pipeline using two buffer slots (0 and 1)
-    // and two CUDA streams, so the GPU works on tile t while the CPU processes tile t-1.
+    // Processes non-empty tiles using two buffer slots (0 and 1) and two CUDA streams,
+    // so GPU work on tile t+1 overlaps with CPU result-collection for tile t.
     //
-    // Buffer slots alternate: slot = t % 2, prev_slot = 1 - slot.
-    // Each slot holds one tile's worth of pinned host memory (host_labels) and device memory.
+    // Buffer slots alternate: slot = t % 2. Each slot has its own pinned host buffer
+    // and device memory, so one slot can be in use by the GPU while the other is being
+    // read by the CPU.
     //
-    // Each iteration:
-    //   1. Launch GPU work for tile t on streams[slot]       (async, returns immediately)
-    //   2. Wait for tile t-1 to finish on streams[prev_slot] (cudaStreamSynchronize)
-    //   3. Read tile t-1 results from gpu_bufs[prev_slot] and store into label_storage
+    // Each iteration t:
+    //   1. Launch GPU work for tile t+1 on streams[1-slot] (async, returns immediately)
+    //   2. Wait for tile t to finish on streams[slot] (cudaStreamSynchronize blocks until done)
+    //   3. Copy tile t results from pinned buffer into label_storage, fill in tile metadata
     //
-    // Step 1 and step 3 overlap in time: while the CPU copies tile t-1 results,
-    // the GPU is already computing tile t on the other stream.
+    // Steps 1 and 3 overlap in time: while the CPU copies tile t, the GPU is already
+    // computing tile t+1 on the other stream.
     //
-    // running_global_offset: counts total foreground labels assigned so far across all
-    //   processed tiles. Each new tile's local labels (1..N) are shifted by this offset
-    //   to make them globally unique across the whole image.
+    // running_global_offset: cumulative foreground label count across all collected tiles.
+    // Each tile's local labels (1..N) are shifted by this to become globally unique.
     //
-    // ne_pending_offset[slot]: the running_global_offset value that was current when
-    //   tile t was launched. Stored per-slot so we can correctly assign global_label_offset
-    //   to tile t-1 after its GPU work completes (by which point running_global_offset
-    //   has already advanced for tile t).
+    // ne_pending_offset[slot]: snapshot of running_global_offset taken when the tile on
+    // that slot was launched. Needed because by the time we collect tile t, running_global_offset
+    // has already advanced for tile t+1.
     std::cout << "--- Phase 1: Per-tile GPU CCL (tile size: " << tile_size << ") ---\n";
     phase_timer.start();
 
     int running_global_offset = 0;
     int total_local_labels = 0;
     int total_non_empty = (int)non_empty_list.size();
+
+    // ne_pending_offset[slot]: snapshot of running_global_offset taken when the tile on
+    // that slot was launched. By the time we collect a tile, running_global_offset has
+    // already advanced for the next tile, so we need this saved value.
+    // Initialized to {0,0} - slot 0 is correct for tile 0 (no tiles before it).
     int ne_pending_offset[2] = {0, 0};
 
-    // Seed the pipeline: launch tile 0 before entering the loop so there is always
-    // a tile in-flight on prev_slot when the loop body tries to collect results.
+    // Seed: launch tile 0 before the loop so the GPU is already working on iteration 0.
     if (total_non_empty > 0) {
         const TileID& id = non_empty_list[0];
         LabelTileGPU(binary_mask.ptr(id.origin_y) + id.origin_x, binary_mask.step[0], id.tile_height, id.tile_width, gpu_bufs[0], streams[0]);
     }
 
-    for (int t = 1; t <= total_non_empty; t++) {
-        int slot  = t % 2;       // buffer slot for tile t
-        int prev_slot = 1 - slot;    // buffer slot for tile t-1 (whose results we collect)
+    // Each iteration collects tile t. Before waiting, it launches tile t+1 so the
+    // GPU stays busy while the CPU reads results - that is the overlap.
+    for (int t = 0; t < total_non_empty; t++) {
+        int slot = t % 2; // which buffer slot tile t is on (alternates 0/1)
 
-        // Launch tile t on the GPU (async) — this runs concurrently with the CPU work below.
-        if (t < total_non_empty) {
-            const TileID& id = non_empty_list[t];
-            LabelTileGPU(binary_mask.ptr(id.origin_y) + id.origin_x, binary_mask.step[0], id.tile_height, id.tile_width, gpu_bufs[slot], streams[slot]);
+        if (t + 1 < total_non_empty) {
+            const TileID& next = non_empty_list[t + 1];
+            // launch tile t+1 on the other slot before waiting for t, so GPU stays busy while CPU reads t
+            LabelTileGPU(binary_mask.ptr(next.origin_y) + next.origin_x, binary_mask.step[0], next.tile_height, next.tile_width, gpu_bufs[1 - slot], streams[1 - slot]);
         }
 
-        // Wait for tile t-1 (on prev_slot) to fully complete — H2D transfer, kernel,
-        // compaction, and D2H of results back to host_labels and h_counter.
-        cudaStreamSynchronize(streams[prev_slot]);
+        cudaStreamSynchronize(streams[slot]); // wait for tile t's GPU work to finish
 
-        // --- Collect results for tile t-1 ---
-        const TileID& p_id = non_empty_list[t - 1];
-        TileInfo& tile = all_tiles[p_id.tile_row * num_tile_cols + p_id.tile_col];
-
-        // global_label_offset: shifts this tile's local labels (1..N) into the global
-        // label space so no two tiles share a label ID. Recorded at the time tile t-1
-        // was launched (ne_pending_offset[prev_slot]), not now, because running_global_offset
-        // may have already advanced for tile t.
-        tile.global_label_offset = ne_pending_offset[prev_slot];
-
-        // h_counter holds the number of foreground components found in this tile.
-        // host_labels holds the compacted per-pixel label result (local IDs 1..num_fg).
-        int num_fg = *gpu_bufs[prev_slot].h_counter;
-
-        // Wrap the pinned host_labels buffer as a cv::Mat (no copy) and copy its
-        // contents into label_storage at this tile's reserved block. This is the only
-        // copy — after this, local_label_mat points directly into label_storage so
-        // Phase 3 can read it without any further allocation or copying.
-        cv::Mat src_mat(p_id.tile_height, p_id.tile_width, CV_32S, gpu_bufs[prev_slot].host_labels, gpu_bufs[prev_slot].max_cols * sizeof(int32_t));
-        int32_t* dst_ptr = label_storage.get() + p_id.storage_offset;
-        cv::Mat dst_mat(p_id.tile_height, p_id.tile_width, CV_32S, dst_ptr, p_id.tile_width * sizeof(int32_t));
-        src_mat.copyTo(dst_mat);
-        tile.local_label_mat = dst_mat;
-        tile.num_local_labels = num_fg + 1; // +1 for background (label 0)
-
-        // Extract the four edge rows/columns of this tile's label result.
-        // These edge labels (shifted to global IDs) are what Phase 2 compares across
-        // adjacent tile boundaries to decide which components to merge.
-        extract_tile_edges(tile, ne_pending_offset[prev_slot]);
-        running_global_offset += num_fg;
+        const TileID& prev_id = non_empty_list[t];
+        TileInfo& cur_tile = all_tiles[prev_id.tile_row * num_tile_cols + prev_id.tile_col]; // metadata entry for tile t
+        cur_tile.global_label_offset = ne_pending_offset[slot]; // cumulative fg label count of all tiles before this one (saved at launch time, since running_global_offset has since advanced)
+        int num_fg = *gpu_bufs[slot].h_counter; // number of foreground components found by the GPU in this tile
+        // pitch (row stride) = max_cols * sizeof(int32_t): the GPU buffer is allocated for
+        // the worst-case tile width, so rows are spaced max_cols apart regardless of actual width.
+        cv::Mat src_mat(prev_id.tile_height, prev_id.tile_width, CV_32S, gpu_bufs[slot].host_labels, gpu_bufs[slot].max_cols * sizeof(int32_t));
+        int32_t* dst_ptr = label_storage.get() + prev_id.storage_offset; // destination in flat label_storage at this tile's pre-assigned slot
+        // label_storage is tightly packed (no padding between rows), so pitch = actual width.
+        cv::Mat dst_mat(prev_id.tile_height, prev_id.tile_width, CV_32S, dst_ptr, prev_id.tile_width * sizeof(int32_t));
+        src_mat.copyTo(dst_mat); // copy from pitched pinned buffer into tightly packed label_storage
+        cur_tile.local_label_mat = dst_mat; // point tile's label mat at its label_storage region, no extra alloc
+        cur_tile.num_local_labels = num_fg + 1; // +1 for background label 0
+        extract_tile_edges(cur_tile, ne_pending_offset[slot]); // convert edge pixel labels to globally unique range
+        running_global_offset += num_fg; // advance global offset by fg component count of this tile
         total_local_labels += num_fg;
 
-        // Record the current global offset for tile t so we can assign it correctly
-        // once tile t's GPU work completes (next iteration's prev_slot collection).
-        if (t < total_non_empty) ne_pending_offset[slot] = running_global_offset;
+        // Record the offset for the next tile now that this tile's fg count is added in.
+        if (t + 1 < total_non_empty)
+            ne_pending_offset[1 - slot] = running_global_offset;
     }
 
+    // Release GPU resources now that all tiles are collected.
     cudaStreamDestroy(streams[0]);
     cudaStreamDestroy(streams[1]);
     FreeGPUTileBuffers(gpu_bufs[0]);
@@ -227,7 +222,7 @@ cv::Mat run_tiled_gpu_ccl(const cv::Mat& binary_mask, int tile_size) {
     std::cout << "Global label range: [1, " << max_global_label << "]\n\n";
 
     std::cout << "--- Phase 2: Seam Merge (CPU Union-Find) ---\n";
-    UnionFind union_find(max_global_label + 1);
+    UnionFind union_find(max_global_label + 1); // size +1 because labels are 1-indexed; index 0 is unused
     phase_timer.start();
     int total_merges = merge_seams(all_tiles, union_find, num_tile_cols, num_tile_rows);
     double phase2_ms = phase_timer.elapsed_ms();
@@ -251,7 +246,7 @@ cv::Mat run_tiled_gpu_ccl(const cv::Mat& binary_mask, int tile_size) {
               << "  [scan: " << scan_ms << " ms, pre-fault: " << prefault_ms << " ms]\n";
     std::cout << "Time - Phase 1 (GPU tile CCL): " << phase1_ms << " ms\n";
     std::cout << "Time - Phase 2 (seam merge): " << phase2_ms << " ms\n";
-    std::cout << "Time - Phase 3 (relabel):  " << phase3_ms << " ms\n";
+    std::cout << "Time - Phase 3 (relabel): " << phase3_ms << " ms\n";
     std::cout << "Time - Total: " << total_ms << " ms\n";
     std::cout << "Throughput: " << throughput_mpix_s << " MPixels/s\n\n";
 

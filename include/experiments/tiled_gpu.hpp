@@ -11,15 +11,15 @@ typedef CUstream_st* cudaStream_t;
 #endif
 
 // Pre-allocated buffers for processing one tile on the GPU.
-// Allocated once at startup (AllocGPUTileBuffers) and reused for every tile —
-// avoids per-tile cudaMalloc/Free which is extremely slow.
-// Sized for the largest possible tile (max_rows × max_cols).
+// Allocated once at startup (AllocGPUTileBuffers) and reused for every tile,
+// avoiding per-tile cudaMalloc/Free which is extremely slow.
+// Sized for the largest possible tile (max_rows x max_cols).
 struct GPUTileBuffers {
-    // --- Device buffers (live in GPU VRAM) ---
+    // --- Device buffers (live in device memory) ---
 
-    // Destination for the H2D transfer of the tile's binary mask (uint8, 0 or 255).
+    // Destination for the host-to-device (H2D) transfer of the tile's binary mask (uint8, 0 or 255).
     // Pitched allocation: rows are padded to a GPU-friendly stride so 2D memory
-    // accesses are aligned to transaction boundaries — faster coalesced reads in kernels.
+    // accesses are aligned to transaction boundaries, enabling faster coalesced reads in kernels.
     uint8_t* device_mask;
 
     // Working buffer for the union-find label array during the CCL kernel.
@@ -47,7 +47,7 @@ struct GPUTileBuffers {
     // concurrently while the CPU is doing other work on a different stream.
 
     // Receives the compact per-pixel label result after D2H transfer.
-    // Row pitch = max_cols elements (not pitched by CUDA — flat host layout).
+    // Row pitch = max_cols elements (not pitched by CUDA, flat host layout).
     // Values are in range 1..num_fg (foreground) or 0 (background).
     // Phase 1 reads this to copy results into label_storage.
     int32_t* host_labels;
@@ -57,15 +57,18 @@ struct GPUTileBuffers {
     int* h_counter;
 
     // --- Dimensions ---
-    int max_rows;        // maximum tile height this buffer was allocated for
-    int max_cols;        // maximum tile width this buffer was allocated for
-    size_t img_pitch_bytes;     // actual row stride of device_mask in bytes (≥ max_cols)
-    size_t labels_pitch_bytes;  // actual row stride of device_labels in bytes (≥ max_cols * sizeof(int))
+    int max_rows; // maximum tile height this buffer was allocated for
+    int max_cols; // maximum tile width this buffer was allocated for
+    size_t img_pitch_bytes; // actual row stride of device_mask in bytes (≥ max_cols)
+    size_t labels_pitch_bytes; // actual row stride of device_labels in bytes (≥ max_cols * sizeof(int))
 };
 
 GPUTileBuffers AllocGPUTileBuffers(int max_rows, int max_cols);
 void FreeGPUTileBuffers(GPUTileBuffers& bufs);
 
+// Launches the full CCL pipeline for one tile asynchronously on the given stream.
+// Results are written to bufs.host_labels and bufs.h_counter.
+// Caller must cudaStreamSynchronize(stream) before reading either.
 void LabelTileGPU(const uint8_t* h_tile, size_t h_tile_stride, int rows, int cols, const GPUTileBuffers& bufs, cudaStream_t stream);
 
 cv::Mat run_tiled_gpu_ccl(const cv::Mat& binary_mask, int tile_size = 1024);

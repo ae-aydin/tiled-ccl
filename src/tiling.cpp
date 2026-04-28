@@ -4,18 +4,17 @@
 #include <opencv2/core.hpp>
 
 
+// Converts edge pixel labels from tile-local to globally unique by adding running_global_offset; background (0) is left as 0.
 void extract_tile_edges(TileInfo& tile, int running_global_offset) {
     // Shift each edge pixel's local label into the globally unique range.
-    // Background (local label 0) stays 0 — it has no identity across tiles.
+    // Background (local label 0) stays 0 - it has no identity across tiles.
     tile.left_edge_labels.resize(tile.height);
     tile.right_edge_labels.resize(tile.height);
     for (int row = 0; row < tile.height; row++) {
         int local_left = tile.local_label_mat.at<int>(row, 0);
         int local_right = tile.local_label_mat.at<int>(row, tile.width - 1);
-
         if (local_left == 0) tile.left_edge_labels[row] = 0;
         else tile.left_edge_labels[row] = local_left + running_global_offset;
-
         if (local_right == 0) tile.right_edge_labels[row] = 0;
         else tile.right_edge_labels[row] = local_right + running_global_offset;
     }
@@ -25,16 +24,15 @@ void extract_tile_edges(TileInfo& tile, int running_global_offset) {
     for (int col = 0; col < tile.width; col++) {
         int local_top = tile.local_label_mat.at<int>(0, col);
         int local_bottom = tile.local_label_mat.at<int>(tile.height - 1, col);
-
         if (local_top == 0) tile.top_edge_labels[col] = 0;
         else tile.top_edge_labels[col] = local_top + running_global_offset;
-
         if (local_bottom == 0) tile.bottom_edge_labels[col] = 0;
         else tile.bottom_edge_labels[col] = local_bottom + running_global_offset;
     }
 }
 
 
+// Splits binary_mask into tiles, runs per-tile CCL, assigns globally unique label offsets, and extracts edge labels for seam merging.
 std::vector<TileInfo> extract_tiles(const cv::Mat& binary_mask, int tile_size, int& out_max_global_label, int& out_total_local_labels) {
     int image_width = binary_mask.cols;
     int image_height = binary_mask.rows;
@@ -106,6 +104,7 @@ std::vector<TileInfo> extract_tiles(const cv::Mat& binary_mask, int tile_size, i
 }
 
 
+// Walks horizontal and vertical seams between adjacent tiles and unions global labels that touch across the boundary.
 int merge_seams(std::vector<TileInfo>& tiles, UnionFind& union_find, int num_tile_cols, int num_tile_rows) {
     int total_merges = 0;
 
@@ -115,10 +114,10 @@ int merge_seams(std::vector<TileInfo>& tiles, UnionFind& union_find, int num_til
             TileInfo& right_tile = tiles[tile_row * num_tile_cols + tile_col + 1];
             int seam_length = std::min((int)left_tile.right_edge_labels.size(), (int)right_tile.left_edge_labels.size());
             for (int pixel = 0; pixel < seam_length; pixel++) {
-                int l = left_tile.right_edge_labels[pixel];
-                int r = right_tile.left_edge_labels[pixel];
-                if (l != 0 && r != 0 && union_find.Find(l) != union_find.Find(r)) {
-                    union_find.Union(l, r);
+                int left_label = left_tile.right_edge_labels[pixel];
+                int right_label = right_tile.left_edge_labels[pixel];
+                if (left_label && right_label && union_find.Find(left_label) != union_find.Find(right_label)) {
+                    union_find.Union(left_label, right_label);
                     total_merges++;
                 }
             }
@@ -131,10 +130,10 @@ int merge_seams(std::vector<TileInfo>& tiles, UnionFind& union_find, int num_til
             TileInfo& bottom_tile = tiles[(tile_row + 1) * num_tile_cols + tile_col];
             int seam_length = std::min((int)top_tile.bottom_edge_labels.size(), (int)bottom_tile.top_edge_labels.size());
             for (int pixel = 0; pixel < seam_length; pixel++) {
-                int t = top_tile.bottom_edge_labels[pixel];
-                int b = bottom_tile.top_edge_labels[pixel];
-                if (t != 0 && b != 0 && union_find.Find(t) != union_find.Find(b)) {
-                    union_find.Union(t, b);
+                int top_label = top_tile.bottom_edge_labels[pixel];
+                int bottom_label = bottom_tile.top_edge_labels[pixel];
+                if (top_label && bottom_label && union_find.Find(top_label) != union_find.Find(bottom_label)) {
+                    union_find.Union(top_label, bottom_label);
                     total_merges++;
                 }
             }
@@ -145,70 +144,55 @@ int merge_seams(std::vector<TileInfo>& tiles, UnionFind& union_find, int num_til
 }
 
 
+// Phase 3: resolve global labels to compact final IDs, then write the output image.
+// Label hierarchy: local (per-tile, resets each tile) -> global (cumulative count of local labels across tiles) -> root (UF representative) -> final (sequential 1..N)
+// tiles: all tiles with their local label mats and edge label vectors
+// union_find: UF structure populated by merge_seams; maps global labels to component roots
+// image_height: full image height for the output label map
+// image_width: full image width for the output label map
+// max_global_label: highest global label assigned across all tiles (upper bound for table sizes)
+// out_num_final_components: number of distinct foreground components found in the whole image
+// returns: int32 label map of the full image; 0 = background, 1..N = component IDs
 cv::Mat build_label_map(const std::vector<TileInfo>& tiles, UnionFind& union_find, int image_height, int image_width, int max_global_label, int& out_num_final_components) {
-    // At this point every foreground pixel in the image has a globally unique label
-    // (an integer in [1, max_global_label]) assigned during Phase 1. Phase 2 ran
-    // union-find over the seams to record which of those global labels belong to the
-    // same connected component across tile boundaries.
-    //
-    // This function has two jobs:
-    //   1. Resolve the union-find to produce a compact final component ID for every
-    //      global label (IDs are 1..num_final_components, no gaps).
-    //   2. Write those final IDs into a full-image int32 label map.
-
-    // --- Step 1: Build a lookup table from global label → final component ID ---
-    //
-    // We do this in a serial loop rather than calling Find() inside the parallel pixel
-    // loop below. Find() performs path compression (it writes to the union-find parent
-    // array to flatten the tree), so calling it from multiple threads simultaneously
-    // would cause data races. Doing it once here, serially, is safe and fast.
-    //
-    // root_to_final_id : maps a root label (canonical representative of a component)
-    //                    to its assigned final ID. Populated on first encounter.
-    // label_to_final_id: maps every global label directly to its final ID, so the
-    //                    parallel pixel loop below only needs a single array lookup.
+    // Build lookup tables serially. Find() does path compression (shortens the tree by writing
+    // UnionFind.parent[x] = root for every node visited). Two threads calling Find() on labels
+    // that share an ancestor would race on those parent[] writes, which is UB even if both write the same value.
+    // root_to_final_id: assigns a sequential ID the first time each UF root is encountered.
+    // label_to_final_id: pre-resolved flat lookup used safely in the parallel pixel loop below.
     std::vector<int> root_to_final_id(max_global_label + 1, 0);
     std::vector<int> label_to_final_id(max_global_label + 1, 0);
     int num_final_components = 0;
     for (int g = 1; g <= max_global_label; g++) {
-        int root = union_find.Find(g); // which component does label g belong to?
-        if (root_to_final_id[root] == 0) // first time we see this root → assign it an ID
+        int root = union_find.Find(g);
+        if (root_to_final_id[root] == 0)
             root_to_final_id[root] = ++num_final_components;
-        label_to_final_id[g] = root_to_final_id[root]; // record final ID for fast lookup
+        label_to_final_id[g] = root_to_final_id[root];
     }
 
-    // --- Step 2: Write the full-image label map in parallel ---
-    //
-    // label_map is the output: same spatial dimensions as the input image, int32 per pixel.
-    // Allocated uninitialized here because every pixel is written by the loop below —
-    // no pixel is left unwritten, so no garbage values escape.
+    // Allocated uninitialized (no cv::Mat::zeros) because tiles are non-overlapping and together
+    // cover the full image, so every pixel gets written exactly once in the loop below.
     cv::Mat label_map(image_height, image_width, CV_32S);
 
-    // Each tile owns a distinct, non-overlapping rectangle of label_map, so parallel
-    // writes across tiles cannot race. label_to_final_id is read-only in this loop.
-    // schedule(dynamic) because tiles vary in size and empty vs non-empty tiles differ
-    // greatly in work — dynamic scheduling balances load across threads.
+    // schedule(dynamic): threads pick tiles one at a time from a queue rather than getting
+    // a fixed pre-assigned chunk. Needed because empty tiles (just a memset) are much faster
+    // than non-empty ones, so a static split would leave some threads idle while others finish late.
     #pragma omp parallel for schedule(dynamic)
     for (int t = 0; t < (int)tiles.size(); t++) {
         const TileInfo& tile = tiles[t];
 
         if (tile.local_label_mat.empty()) {
-            // Empty tile (all background): local_label_mat was never written,
-            // so there are no foreground labels to look up. Write zeros directly.
             for (int row = 0; row < tile.height; row++)
                 memset(label_map.ptr<int>(tile.origin_y + row) + tile.origin_x, 0, tile.width * sizeof(int));
             continue;
         }
 
         for (int row = 0; row < tile.height; row++) {
-            const int* src = tile.local_label_mat.ptr<int>(row);  // local label per pixel (0 = background, 1..N = foreground)
+            const int* src = tile.local_label_mat.ptr<int>(row);
             int* dst = label_map.ptr<int>(tile.origin_y + row) + tile.origin_x;
             for (int col = 0; col < tile.width; col++) {
                 int local = src[col];
-                if (local == 0) { dst[col] = 0; continue; }  // background pixel → 0
-                // local + global_label_offset converts the tile-local label into the
-                // globally unique label assigned during Phase 1. label_to_final_id then
-                // maps that to the final merged component ID from Phase 2.
+                if (local == 0) { dst[col] = 0; continue; }
+                // local -> global (add offset) -> final ID (table lookup)
                 dst[col] = label_to_final_id[local + tile.global_label_offset];
             }
         }
