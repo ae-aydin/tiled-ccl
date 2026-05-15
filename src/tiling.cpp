@@ -140,6 +140,34 @@ int merge_seams(std::vector<TileInfo>& tiles, UnionFind& union_find, int num_til
         }
     }
 
+    // Union diagonal pixel pairs at four-tile junctions (8-connectivity requires this).
+    // At each interior corner where TL, TR, BL, BR meet, only the two diagonal pixel pairs
+    // are not covered by the horizontal/vertical seam loops above.
+    for (int tile_row = 0; tile_row < num_tile_rows - 1; tile_row++) {
+        for (int tile_col = 0; tile_col < num_tile_cols - 1; tile_col++) {
+            TileInfo& tl = tiles[tile_row * num_tile_cols + tile_col];
+            TileInfo& tr = tiles[tile_row * num_tile_cols + tile_col + 1];
+            TileInfo& bl = tiles[(tile_row + 1) * num_tile_cols + tile_col];
+            TileInfo& br = tiles[(tile_row + 1) * num_tile_cols + tile_col + 1];
+
+            // TL bottom-right corner <-> BR top-left corner
+            int a = tl.bottom_edge_labels[tl.bottom_edge_labels.size() - 1];
+            int b = br.top_edge_labels[0];
+            if (a && b && union_find.Find(a) != union_find.Find(b)) {
+                union_find.Union(a, b);
+                total_merges++;
+            }
+
+            // TR bottom-left corner <-> BL top-right corner
+            int c = tr.bottom_edge_labels[0];
+            int d = bl.top_edge_labels[bl.top_edge_labels.size() - 1];
+            if (c && d && union_find.Find(c) != union_find.Find(d)) {
+                union_find.Union(c, d);
+                total_merges++;
+            }
+        }
+    }
+
     return total_merges;
 }
 
